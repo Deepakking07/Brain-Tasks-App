@@ -4,21 +4,22 @@ phases:
   pre_build:
     commands:
       - echo Logging in to Amazon ECR...
-      - aws --version
       - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 701109631591.dkr.ecr.us-east-1.amazonaws.com
+
   build:
     commands:
       - echo Building the Docker image...
       - docker build -t brain-tasks-app .
-      # Tag the Docker image with your ECR URI
-      - docker tag brain-tasks-app 701109631591.dkr.ecr.us-east-1.amazonaws.com/brain-tasks-app:latest
+      - docker tag brain-tasks-app:latest 701109631591.dkr.ecr.us-east-1.amazonaws.com/brain-tasks-app:latest
+
   post_build:
     commands:
       - echo Pushing the Docker image to ECR...
       - docker push 701109631591.dkr.ecr.us-east-1.amazonaws.com/brain-tasks-app:latest
-      - echo Writing image definitions file for CodeDeploy/CodePipeline...
-      - printf '[{"name":"brain-tasks-container","imageUri":"701109631591.dkr.ecr.us-east-1.amazonaws.com/brain-tasks-app:latest"}]' > imagedefinitions.json
+      - echo Creating imagedefinitions.json file...
+      - echo '[{"name":"brain-tasks-app","imageUri":"701109631591.dkr.ecr.us-east-1.amazonaws.com/brain-tasks-app:latest"}]' > imagedefinitions.json
 
 artifacts:
   files:
     - imagedefinitions.json
+
