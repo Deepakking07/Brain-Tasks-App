@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: brain-tasks-deployment
-  namespace: deploy-variables
+  namespace: deploy-variables   # Ensure this namespace exists
   labels:
     app: brain-tasks-app
 spec:
