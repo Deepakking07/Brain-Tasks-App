@@ -20,7 +20,6 @@ spec:
           image: 701109631591.dkr.ecr.us-east-1.amazonaws.com/brain-tasks-app:latest
           ports:
             - containerPort: 80
-          # Optional: health checks
           readinessProbe:
             httpGet:
               path: /
