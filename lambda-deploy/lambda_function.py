@@ -1,96 +1,127 @@
 import json
 import boto3
-import base64
-import subprocess
-import os
 import tempfile
+from kubernetes import client
 import zipfile
-from urllib.parse import urlparse
+import os
+import base64
+from botocore.signers import RequestSigner
+
 
 def lambda_handler(event, context):
-    # Initialize clients
     codepipeline = boto3.client('codepipeline')
     s3 = boto3.client('s3')
-    
+
     try:
-        # Get job details
         job_id = event['CodePipeline.job']['id']
         input_artifacts = event['CodePipeline.job']['data']['inputArtifacts']
-        
-        # Download build artifacts
-        if input_artifacts:
-            location = input_artifacts[0]['location']['s3Location']
-            bucket = location['bucketName']
-            key = location['objectKey']
-            
-            # Download and extract artifacts
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                s3.download_file(bucket, key, tmp_file.name)
-                
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    with zipfile.ZipFile(tmp_file.name, 'r') as zip_ref:
-                        zip_ref.extractall(tmp_dir)
-                    
-                    # Read image definitions
-                    image_def_path = os.path.join(tmp_dir, 'imagedefinitions.json')
-                    if os.path.exists(image_def_path):
-                        with open(image_def_path, 'r') as f:
-                            image_definitions = json.load(f)
-                        
-                        # Update Kubernetes deployment
-                        result = update_eks_deployment(image_definitions[0]['imageUri'])
-                        
-                        if result:
-                            codepipeline.put_job_success_result(jobId=job_id)
-                            return {'statusCode': 200, 'body': 'Deployment successful'}
-                        else:
-                            raise Exception('EKS deployment failed')
-                    else:
-                        raise Exception('imagedefinitions.json not found')
-        
-        else:
-            raise Exception('No input artifacts found')
-            
+
+        if not input_artifacts:
+            raise Exception("No input artifacts found")
+
+        location = input_artifacts[0]['location']['s3Location']
+        bucket = location['bucketName']
+        key = location['objectKey']
+
+        # Download artifact zip from S3
+        with tempfile.NamedTemporaryFile() as tmp_file:
+            s3.download_file(bucket, key, tmp_file.name)
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                with zipfile.ZipFile(tmp_file.name, 'r') as zip_ref:
+                    zip_ref.extractall(tmp_dir)
+
+                image_def_path = os.path.join(tmp_dir, 'imagedefinitions.json')
+                if not os.path.exists(image_def_path):
+                    raise Exception("imagedefinitions.json not found")
+
+                with open(image_def_path, 'r') as f:
+                    image_definitions = json.load(f)
+
+                image_uri = image_definitions[0]['imageUri']
+                print(f"Deploying image: {image_uri}")
+
+                if update_eks_deployment(image_uri):
+                    codepipeline.put_job_success_result(jobId=job_id)
+                    return {"statusCode": 200, "body": "Deployment successful"}
+                else:
+                    raise Exception("EKS deployment failed")
+
     except Exception as e:
-        print(f'Error: {str(e)}')
+        print(f"Error: {str(e)}")
         codepipeline.put_job_failure_result(
             jobId=job_id,
-            failureDetails={'message': str(e), 'type': 'JobFailed'}
+            failureDetails={"message": str(e), "type": "JobFailed"}
         )
-        return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+        return {"statusCode": 500, "body": f"Error: {str(e)}"}
+
+
+def get_eks_token(cluster_name, region):
+    session = boto3.session.Session()
+    eks_client = session.client("eks", region_name=region)
+    service_id = eks_client.meta.service_model.service_id
+
+    signer = RequestSigner(
+        service_id,
+        region,
+        "sts",
+        "v4",
+        session.get_credentials(),
+        session.events,
+    )
+
+    params = {
+        "method": "GET",
+        "url": "https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15",
+        "body": {},
+        "headers": {"x-k8s-aws-id": cluster_name},
+        "context": {},
+    }
+
+    signed_url = signer.generate_presigned_url(
+        params,
+        region_name=region,
+        expires_in=60,
+        operation_name="",
+    )
+
+    return "k8s-aws-v1." + base64.urlsafe_b64encode(signed_url.encode()).decode().rstrip("=")
+
 
 def update_eks_deployment(image_uri):
     try:
-        # Configure kubectl
-        os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
-        
-        # Update kubeconfig
-        subprocess.run([
-            'aws', 'eks', 'update-kubeconfig', 
-            '--region', 'us-east-1', 
-            '--name', 'brain-tasks-cluster'
-        ], check=True)
-        
-        # Update deployment image
-        subprocess.run([
-            'kubectl', 'set', 'image', 
-            'deployment/brain-tasks-app', 
-            f'brain-tasks-app={image_uri}'
-        ], check=True)
-        
-        # Wait for rollout to complete
-        subprocess.run([
-            'kubectl', 'rollout', 'status', 
-            'deployment/brain-tasks-app', 
-            '--timeout=300s'
-        ], check=True)
-        
-        print(f'Successfully deployed image: {image_uri}')
+        region = "us-east-1"          # adjust if needed
+        cluster_name = "brain-tasks-cluster"
+        namespace = "default"
+        deployment_name = "brain-tasks-app"
+
+        eks = boto3.client("eks", region_name=region)
+        cluster_info = eks.describe_cluster(name=cluster_name)["cluster"]
+
+        # Build Kubernetes client config
+        configuration = client.Configuration()
+        configuration.host = cluster_info["endpoint"]
+        configuration.verify_ssl = True
+
+        ca_file = tempfile.NamedTemporaryFile(delete=False)
+        ca_file.write(base64.b64decode(cluster_info["certificateAuthority"]["data"]))
+        ca_file.flush()
+        configuration.ssl_ca_cert = ca_file.name
+
+        token = get_eks_token(cluster_name, region)
+        configuration.api_key = {"authorization": "Bearer " + token}
+
+        client.Configuration.set_default(configuration)
+
+        # Patch deployment image
+        apps_v1 = client.AppsV1Api()
+        deployment = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+        deployment.spec.template.spec.containers[0].image = image_uri
+        apps_v1.patch_namespaced_deployment(deployment_name, namespace, deployment)
+
+        print(f"Updated deployment {deployment_name} with image {image_uri}")
         return True
-        
-    except subprocess.CalledProcessError as e:
-        print(f'kubectl command failed: {e}')
-        return False
+
     except Exception as e:
-        print(f'Deployment error: {e}')
+        print(f"Error updating EKS: {e}")
         return False
